@@ -23,6 +23,8 @@
     h1 { font-size: 22px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
     .meta { color: var(--muted); font-size: 13px; }
     .meta b { color: var(--text); font-weight: 600; }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+           background: var(--accent); margin-right: 6px; vertical-align: middle; }
 
     .filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
                margin-bottom: 18px; }
@@ -32,7 +34,6 @@
                      border-right: 1px solid var(--border); user-select: none; }
     .segment label:last-child { border-right: 0; }
     .segment input { display: none; }
-    .segment input:checked + span { color: var(--bg); }
     .segment label:has(input:checked) { background: var(--accent); }
     .segment label:has(input:checked) span { color: #06210f; font-weight: 600; }
 
@@ -42,8 +43,6 @@
     }
     input[type=text] { min-width: 200px; }
     select:focus, input[type=text]:focus { border-color: var(--accent-dim); }
-    .check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted);
-             font-size: 13px; cursor: pointer; }
 
     .card { border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
             background: var(--panel); }
@@ -68,6 +67,7 @@
             border: 1px solid var(--accent-dim); border-radius: 20px; padding: 1px 8px;
             margin-left: 8px; vertical-align: middle; }
     .empty { padding: 60px 20px; text-align: center; color: var(--muted); }
+    footer { color: var(--muted); font-size: 12px; margin-top: 18px; text-align: right; }
     col.c-job { width: 34%; } col.c-sal { width: 16%; } col.c-loc { width: 22%; }
     col.c-contact { width: 16%; } col.c-date { width: 12%; }
     @media (max-width: 720px) {
@@ -81,39 +81,33 @@
     <header>
       <h1>ML / AI / LLM Vacancies</h1>
       <div class="meta">
-        Showing <b>{{ count }}</b> ·
-        {{ meta.total }} total in DB ·
-        last scraped {{ meta.last_scraped[:16] if meta.last_scraped else "never" }}
+        <span class="dot" title="auto-scraped every {{ interval_minutes }} minutes"></span>
+        Showing <b id="shown">{{ count }}</b> of {{ count }} ·
+        last {{ retention_days }} days ·
+        updated <span id="updated" data-at="{{ meta.last_scraped or '' }}">{{ (meta.last_scraped or 'never')[:16] }}</span>
       </div>
     </header>
 
-    <form class="filters" method="get" id="f">
-      <div class="segment">
-        {% for label, d in ranges %}
+    <div class="filters">
+      <div class="segment" id="ranges">
+        {% for r in ranges %}
         <label>
-          <input type="radio" name="days" value="{{ d if d is not none else '' }}"
-                 {% if d == active_days %}checked{% endif %}
-                 onchange="document.getElementById('f').submit()">
-          <span>{{ label }}</span>
+          <input type="radio" name="range" value="{{ r.key }}"
+                 {% if r.key == default_range %}checked{% endif %}>
+          <span>{{ r.label }}</span>
         </label>
         {% endfor %}
       </div>
 
-      <select name="channel" onchange="document.getElementById('f').submit()">
+      <select id="channel">
         <option value="">All channels</option>
         {% for c in channels %}
-        <option value="{{ c }}" {% if c == active_channel %}selected{% endif %}>{{ c }}</option>
+        <option value="{{ c }}">{{ c }}</option>
         {% endfor %}
       </select>
 
-      <label class="check">
-        <input type="checkbox" name="remote" value="1" {% if remote %}checked{% endif %}
-               onchange="document.getElementById('f').submit()">
-        Remote only
-      </label>
-
-      <input type="text" name="q" value="{{ query }}" placeholder="Search title / company / text…">
-    </form>
+      <input type="text" id="q" placeholder="Search title / company / text…">
+    </div>
 
     <div class="card">
       {% if vacancies %}
@@ -125,9 +119,9 @@
         <thead>
           <tr><th>Job</th><th>Salary</th><th>Location</th><th>Contact</th><th>Posted</th></tr>
         </thead>
-        <tbody>
+        <tbody id="rows">
           {% for v in vacancies %}
-          <tr>
+          <tr data-ts="{{ v.posted_ts }}" data-channel="{{ v.channel }}" data-search="{{ v.search }}">
             <td>
               <a class="job-title" href="{{ v.url }}" target="_blank" rel="noopener">{{ v.title }}</a>
               {% if v.remote %}<span class="pill">remote</span>{% endif %}
@@ -142,15 +136,113 @@
               <span>{{ v.contact }}</span>
               {% endif %}
             </td>
-            <td class="posted">{{ v.posted }}</td>
+            <td class="posted">
+              <time datetime="{{ v.posted_at }}" title="{{ v.posted_at }}">{{ v.posted_label }}</time>
+            </td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
+      <div class="empty" id="nomatch" hidden>No vacancies in this time range.</div>
       {% else %}
-      <div class="empty">No vacancies match these filters.<br>Run <code>python main.py scrape --days 30</code> to pull more.</div>
+      <div class="empty">Nothing scraped yet — the next run picks up new posts automatically.</div>
       {% endif %}
     </div>
+
+    <footer>
+      auto-scraped every {{ interval_minutes }} min · posts older than {{ retention_days }} days are deleted ·
+      page built {{ generated_at }}
+    </footer>
   </div>
+
+  <script>
+    (function () {
+      var DAY = 86400000;
+      var RANGE_DAYS = { {% for r in ranges %}"{{ r.key }}": {{ r.days if r.days is not none else 'null' }}{{ "," if not loop.last }}{% endfor %} };
+      var rows = Array.prototype.slice.call(document.querySelectorAll("#rows tr"));
+      var shown = document.getElementById("shown");
+      var nomatch = document.getElementById("nomatch");
+      var channelSel = document.getElementById("channel");
+      var qInput = document.getElementById("q");
+
+      function cutoff(key) {
+        var days = RANGE_DAYS[key];
+        if (days === null || days === undefined) {
+          var d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime();
+        }
+        return Date.now() - days * DAY;
+      }
+
+      function currentRange() {
+        var el = document.querySelector('#ranges input:checked');
+        return el ? el.value : "{{ default_range }}";
+      }
+
+      function relative(ts) {
+        var mins = Math.floor((Date.now() - ts) / 60000);
+        if (mins < 1) return "just now";
+        if (mins < 60) return mins + "m ago";
+        var hrs = Math.floor(mins / 60);
+        if (hrs < 24) return hrs + "h ago";
+        var days = Math.floor(hrs / 24);
+        if (days === 1) return "yesterday";
+        if (days < 30) return days + "d ago";
+        return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+      }
+
+      function apply() {
+        var since = cutoff(currentRange());
+        var chan = channelSel ? channelSel.value : "";
+        var q = (qInput ? qInput.value : "").trim().toLowerCase();
+        var n = 0;
+        rows.forEach(function (tr) {
+          var ok = Number(tr.dataset.ts) >= since
+            && (!chan || tr.dataset.channel === chan)
+            && (!q || tr.dataset.search.indexOf(q) !== -1);
+          tr.hidden = !ok;
+          if (ok) n++;
+        });
+        if (shown) shown.textContent = n;
+        if (nomatch) nomatch.hidden = n !== 0;
+        sync();
+      }
+
+      function sync() {
+        var p = new URLSearchParams();
+        if (currentRange() !== "{{ default_range }}") p.set("range", currentRange());
+        if (channelSel && channelSel.value) p.set("channel", channelSel.value);
+        if (qInput && qInput.value.trim()) p.set("q", qInput.value.trim());
+        var qs = p.toString();
+        history.replaceState(null, "", qs ? "?" + qs : location.pathname);
+      }
+
+      function restore() {
+        var p = new URLSearchParams(location.search);
+        var r = p.get("range");
+        if (r && RANGE_DAYS.hasOwnProperty(r)) {
+          var el = document.querySelector('#ranges input[value="' + r + '"]');
+          if (el) el.checked = true;
+        }
+        if (channelSel && p.get("channel")) channelSel.value = p.get("channel");
+        if (qInput && p.get("q")) qInput.value = p.get("q");
+      }
+
+      document.querySelectorAll("#rows time").forEach(function (t) {
+        var ts = Number(t.closest("tr").dataset.ts);
+        if (ts) t.textContent = relative(ts);
+      });
+      var upd = document.getElementById("updated");
+      if (upd && upd.dataset.at) {
+        var t = Date.parse(upd.dataset.at);
+        if (!isNaN(t)) { upd.title = upd.dataset.at; upd.textContent = relative(t); }
+      }
+
+      document.getElementById("ranges").addEventListener("change", apply);
+      if (channelSel) channelSel.addEventListener("change", apply);
+      if (qInput) qInput.addEventListener("input", apply);
+      restore();
+      apply();
+    })();
+  </script>
 </body>
 </html>

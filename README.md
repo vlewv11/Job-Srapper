@@ -2,10 +2,18 @@
 
 Scrapes ML / AI / LLM **Engineer / Researcher** vacancies (and derivatives)
 from Telegram channels, filters them with regex (Russian + English), stores
-them in SQLite, and serves a dark dashboard for browsing by time window.
+them in SQLite, and publishes a dark dashboard.
+
+It runs itself: **every 10 minutes** it pulls only what was posted since the
+last cycle, and **posts older than 30 days are deleted** from the database.
 
 ```
-Telegram channels ──▶ scraper (Telethon) ──▶ regex parser ──▶ SQLite ──▶ dashboard (FastAPI)
+   every 10 min
+        │
+Telegram channels ──▶ scraper (Telethon) ──▶ regex parser ──▶ SQLite ──▶ dashboard
+                          ▲                                     │           (live or static)
+                          └── per-channel watermark ────────────┘
+                                                     30-day retention prune
 ```
 
 ## Setup
@@ -27,27 +35,106 @@ Telegram channels ──▶ scraper (Telethon) ──▶ regex parser ──▶ 
    member of any private channel.
 
 4. **Log in once** (interactive — enter your phone + the code Telegram sends).
-   A `.session` file is saved so later runs are non-interactive:
+   A session file is saved under `data/` so later runs are non-interactive:
    ```bash
    uv run python main.py login
+   ```
+
+5. **Fill the database** with the last 30 days, once:
+   ```bash
+   uv run python main.py backfill --days 30
    ```
 
 ## Usage
 
 ```bash
-# Scrape the last 7 days (default) or any window:
-uv run python main.py scrape --days 7
-uv run python main.py scrape --days 30
+# Serve the dashboard AND auto-scrape every 10 minutes (the normal way to run it):
+uv run python main.py run                  # http://127.0.0.1:9000
+uv run python main.py run --interval 5     # different cadence
+uv run python main.py run --no-scrape      # dashboard only
 
-# Launch the dashboard at http://127.0.0.1:9000
-uv run python main.py serve
+# One cycle by hand (this is what the GitHub Action runs):
+uv run python main.py scrape               # incremental + prune
+uv run python main.py scrape --full        # ignore watermarks, re-read the window
 
-# Debug the regex on a single message (no Telegram needed):
+# One-off maintenance / debugging:
+uv run python main.py backfill --days 30   # full re-read of a window
+uv run python main.py prune                # drop everything older than 30 days
+uv run python main.py build                # export the static site to site/
 uv run python main.py parse "Senior LLM Engineer, remote, $150k/year"
+uv run python main.py session              # print the TG_SESSION secret for CI
 ```
 
-The dashboard filters (time range **7d / 30d / 90d / All**, channel, remote-only,
-and full-text search) are all URL query params, so any view is shareable.
+Settings are environment variables (`.env` works): `SCRAPE_INTERVAL_MINUTES`
+(default `10`), `RETENTION_DAYS` (default `30`), `DB_PATH`, `SITE_DIR`,
+`CHANNELS_FILE`.
+
+## Smart (incremental) scraping
+
+Every message Telegram returns carries its id and post time, and messages come
+back newest-first — so a cycle never downloads the whole history:
+
+- each channel stores a **watermark** (`channel_state.last_message_id`), and
+  the next cycle asks Telegram only for messages *after* it;
+- iteration **stops at the first post older than the window**, so nothing
+  beyond retention is ever fetched;
+- the watermark only moves forward, and only when a channel was walked
+  end-to-end — a flood-wait or a dropped connection re-reads instead of
+  skipping;
+- a cycle ends with the retention prune, so **posts older than 30 days are
+  deleted automatically**.
+
+A full 30-day backfill reads ~1500 posts across 14 channels; the incremental
+cycle that follows reads 0 and finishes in seconds.
+
+## Dashboard
+
+Three time filters — **Today / 7 days / 30 days** — plus a channel picker and
+full-text search. Filtering happens in the browser over the whole retention
+window, so the page is instant, shareable (`?range=30d&channel=…&q=…`) and
+identical whether it is served by FastAPI or as a static file. Timestamps are
+rendered client-side, so a page built an hour ago still says "1h ago".
+
+`GET /healthz` reports row count, last scrape time and the active settings.
+
+## Deploying free on GitHub Pages
+
+`.github/workflows/scrape-deploy.yml` is the whole deployment: a `*/10` cron
+scrapes, prunes, rebuilds the static site and publishes it to
+`https://<user>.github.io/<repo>/`.
+
+1. **Settings → Pages → Source: GitHub Actions.**
+2. **Settings → Secrets and variables → Actions**, add:
+   | Secret | Value |
+   |---|---|
+   | `TG_API_ID`   | from my.telegram.org |
+   | `TG_API_HASH` | from my.telegram.org |
+   | `TG_SESSION`  | output of `uv run python main.py session` |
+3. Push to `master`. The workflow can also be started by hand from the
+   **Actions** tab (with optional `full` / `days` inputs).
+
+`TG_SESSION` is an exported Telethon *string session* — CI has no session file
+of its own. It is a login credential: keep it in Actions secrets only, and
+re-run `main.py session` if you ever revoke the session in Telegram.
+
+**How state survives between runs.** The SQLite file is force-pushed to a
+parentless `state` branch after every successful cycle and restored at the
+start of the next one, so watermarks and vacancies persist while that branch's
+history never grows. The branch is machine-managed — don't commit to it.
+
+**Worth knowing.**
+
+- Keep the repo **public**: Pages and Actions minutes are free there. On a
+  private repo a `*/10` cron would exhaust the free Actions minutes in days.
+- GitHub's cron is best-effort — a run can be delayed or skipped when the
+  runner pool is busy, and **scheduled workflows are disabled after 60 days
+  without repository activity**.
+- Every deployed page is public. Only publish channels you are comfortable
+  republishing.
+- If Telegram fails, the step is non-fatal: the previous data is redeployed and
+  the next cycle catches up.
+
+`.github/workflows/ci.yml` runs the test suite on every push and pull request.
 
 ## How matching works
 
@@ -74,7 +161,7 @@ The parser also filters out non-vacancies:
 "digest" posts are split into one row each; trailing channel-promo footers are
 trimmed off.
 
-All vocabulary lives at the top of [`src/patterns.py`](src/patterns.py) — add
+All vocabulary lives at the top of [`src/scraping/patterns.py`](src/scraping/patterns.py) — add
 the terms your channels actually use to tune precision/recall. Field extraction
 (title / company / salary / location) prefers explicit labels (`Salary:`,
 `Локация:`) and falls back to currency/keyword heuristics, so it is best-effort
@@ -84,14 +171,27 @@ link); if the post has none, it falls back to the poster's Telegram account
 
 ## Layout
 
-| File | Role |
-|------|------|
-| `src/patterns.py`  | regex matching + field extraction (the part to tune) |
-| `src/db.py`        | SQLite schema, dedup upsert, filtered queries |
-| `src/scraper.py`   | Telethon channel reader + time window + CV-topic skip |
-| `src/dashboard.py` | FastAPI app |
-| `src/templates/`   | dashboard HTML |
-| `main.py`          | CLI (`login` / `scrape` / `serve` / `parse`) |
+```
+main.py                     CLI: login · session · scrape · backfill · prune · build · run · parse
+channels.txt                the channels to read
+data/                       local state, never committed (vacancies.db, job_scraper.session)
+src/
+├── config.py               settings (interval, retention, paths) from the environment
+├── db.py                   SQLite schema, dedup upsert, watermarks, retention prune
+├── scraping/
+│   ├── patterns.py         regex matching + field extraction (the part to tune)
+│   ├── telegram.py         Telethon reader — incremental window + CV-topic skip
+│   └── scheduler.py        the every-10-minutes loop
+└── web/
+    ├── app.py              FastAPI app (`/`, `/healthz`)
+    ├── render.py           page model shared by the live and static dashboards
+    ├── build.py            static export for GitHub Pages
+    └── templates/          dashboard HTML + client-side filtering
+tests/                      uv run pytest
+.github/workflows/          ci.yml (tests) · scrape-deploy.yml (cron → Pages)
+```
+
+The code carries no comments by design — the README is the documentation.
 
 Deduplication is by `(channel, message_id, slot)` — re-scraping an overlapping
 window refreshes a post's rows instead of duplicating them (`slot` distinguishes

@@ -1,0 +1,112 @@
+name: Scrape & Deploy
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Ignore the per-channel watermarks and re-read the whole window"
+        type: boolean
+        default: false
+      days:
+        description: "Window in days"
+        type: string
+        default: "30"
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "main.py"
+      - "channels.txt"
+      - ".github/workflows/scrape-deploy.yml"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: scrape-deploy
+  cancel-in-progress: false
+
+env:
+  STATE_BRANCH: state
+  DB_PATH: data/vacancies.db
+  RETENTION_DAYS: "30"
+  SCRAPE_INTERVAL_MINUTES: "10"
+  SITE_DIR: site
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --no-dev
+
+      - name: Restore the database
+        run: |
+          mkdir -p data
+          if git ls-remote --exit-code --heads origin "$STATE_BRANCH" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "$STATE_BRANCH"
+            git show FETCH_HEAD:vacancies.db > "$DB_PATH"
+            echo "Restored $(du -h "$DB_PATH" | cut -f1) from '$STATE_BRANCH'."
+          else
+            echo "No '$STATE_BRANCH' branch yet — starting from an empty database."
+          fi
+
+      - name: Scrape Telegram
+        id: scrape
+        continue-on-error: true
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          FULL: ${{ inputs.full && '--full' || '' }}
+          DAYS: ${{ inputs.days || '30' }}
+        run: |
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ] || [ -z "$TG_SESSION" ]; then
+            echo "::warning::Telegram secrets are not set — publishing existing data without scraping."
+            uv run python main.py prune
+            exit 0
+          fi
+          uv run python main.py scrape --days "$DAYS" $FULL
+
+      - name: Persist the database
+        if: steps.scrape.outcome == 'success'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          blob=$(git hash-object -w "$DB_PATH")
+          tree=$(printf '100644 blob %s\tvacancies.db\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "data: $(date -u +%Y-%m-%dT%H:%M:%SZ)")
+          git push --force origin "$commit:refs/heads/$STATE_BRANCH"
+
+      - name: Build the static dashboard
+        run: |
+          uv run python main.py build
+          ls -la "$SITE_DIR"
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: scrape
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

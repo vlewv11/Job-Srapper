@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Static site builds from an empty database
+        env:
+          DB_PATH: ${{ runner.temp }}/smoke.db
+          SITE_DIR: ${{ runner.temp }}/smoke-site
+        run: |
+          uv run python main.py build
+          test -s "$SITE_DIR/index.html"

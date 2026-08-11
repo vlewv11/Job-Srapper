@@ -1,7 +1,7 @@
 [project]
 name = "job-scrapper"
-version = "0.1.0"
-description = "Scrape ML/AI/LLM job postings from Telegram channels into SQLite with a dashboard"
+version = "0.2.0"
+description = "Auto-scrape ML/AI/LLM job postings from Telegram into SQLite, with a self-updating dashboard"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -11,3 +11,14 @@ dependencies = [
     "telethon>=1.44.0",
     "uvicorn[standard]>=0.51.0",
 ]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.4.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

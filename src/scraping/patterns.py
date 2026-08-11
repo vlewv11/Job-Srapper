@@ -140,7 +140,6 @@ _SALARY_NEGOTIABLE = re.compile(
         |by\s+agreement|обсуждается(?:\s+индивидуально)?)""",
     _FLAGS,
 )
-# A money figure sitting in this context is funding/valuation/AUM, not pay.
 _INVEST = re.compile(
     r"""(?:инвестиц|привлек|раунд|\bround\b|\braised?\b|\bseed\b|series\s*[a-e]\b
         |венчур|valuation|оцен(?:ка|ен|ил)\w*|под\s+управлени|\bAUM\b
@@ -148,12 +147,8 @@ _INVEST = re.compile(
         |размер\s+команд|team\s+size|funding)""",
     _FLAGS,
 )
-# Salaries use k/thousands; M/B magnitudes are funding/valuation, never pay.
 _MAGNITUDE_BIG = re.compile(r"^\s*(?:M\b|B\b|млн|млрд|million|billion|kk)", re.IGNORECASE)
 
-# Course / webinar / paid-ad posts (not vacancies). High-precision on purpose:
-# `erid=` is Russia's mandatory ad token; the rest are unambiguous course phrases.
-# NOTE: internships (стажировка) and perk-mentions (скидки, курсы) are NOT here.
 _PROMO = re.compile(
     r"""(?:
           \b erid \s* =
@@ -169,12 +164,9 @@ _PROMO = re.compile(
     _FLAGS,
 )
 
-# Multi-vacancy splitting: numbered items and separator/divider lines.
 _NUM_ITEM = re.compile(r"(?m)^\s*\d{1,2}[\).]\s+(?=\S)")
 _SEP_LINE = re.compile(r"(?m)^[ \t]*[─—–\-=_•·*~>#]{3,}[ \t]*$")
 _DIGEST = re.compile(r"дайджест|digest|подборк\w*\s+вакансий", re.IGNORECASE)
-# A segment counts as a real vacancy entry only if it also carries a detail
-# signal (company / location / apply / money) — filters out digest headers.
 _DETAIL = re.compile(
     r"""(?:/|@|\bв\s+[«"A-ZА-ЯЁ]|\bat\s+[A-Z]|remote|удал[её]|hybrid|гибрид
         |apply|отклик|relocation|релокац|\$|€|₽|руб|zł|локац|location|город
@@ -218,9 +210,6 @@ _CANDIDATE = re.compile(
     _FLAGS,
 )
 
-# Non-ML roles that occasionally match via a parenthetical "(AI)" but are never
-# the target profile. Kept narrow on purpose so "Backend Engineer (GenAI)" etc.
-# still pass.
 _NEGATIVE_TITLE = re.compile(
     r"""\b(?:
           a?qa \s* engineer | qa \s* automation | automation \s* qa | sdet
@@ -303,12 +292,10 @@ def extract_company(text: str) -> str | None:
 
 
 def _is_investment(s: str, m: re.Match) -> bool:
-    """True if a money match is funding/valuation, not compensation."""
     if _INVEST.search(s[max(0, m.start() - 25): m.start()]):
         return True
     if _MAGNITUDE_BIG.match(s[m.end(): m.end() + 10]):
         return True
-    # `_AMOUNT` swallows the magnitude word (млн/M), so also check the match itself.
     if re.search(r"млн|млрд|million|billion|\bkk\b|\bb\b", m.group(0), re.IGNORECASE):
         return True
     return False
@@ -392,12 +379,6 @@ def extract_contact(text: str) -> str | None:
 
 
 def _prep_segment(seg: str) -> str | None:
-    """Clean a split segment; return the trimmed vacancy text or None.
-
-    Trailing footer/navigation lines ("Больше вакансий в нашем канале @x",
-    "@jaabz_bot") are cut off — otherwise they either become junk vacancies
-    (oversplit) or, when glued to the last real item, kill it (undersplit).
-    """
     seg = seg.strip()
     lines = seg.splitlines()
     cut = next((i for i, ln in enumerate(lines) if _SEG_JUNK.search(ln)), None)
@@ -415,11 +396,6 @@ def _prep_segment(seg: str) -> str | None:
 
 
 def split_vacancies(text: str) -> list[str]:
-    """Split a multi-vacancy post into per-vacancy segments.
-
-    Only splits on clear structure (numbered lists, digest markers, divider
-    lines); a normal single post is returned unchanged as [text].
-    """
     if len(_NUM_ITEM.findall(text)) >= 2:
         parts = _NUM_ITEM.split(text)[1:]
     elif _DIGEST.search(text):
@@ -450,13 +426,10 @@ def _build_vacancy(text: str) -> Vacancy | None:
 
 
 def _strip_junk_lines(text: str) -> str:
-    """Drop footer/navigation lines ("Больше вакансий в нашем канале @x") that
-    are never part of a real vacancy but can be mistaken for one."""
     return "\n".join(ln for ln in text.splitlines() if not _SEG_JUNK.search(ln))
 
 
 def parse_all(text: str) -> list[Vacancy]:
-    """Parse a message into zero or more vacancies."""
     if not text or is_candidate_post(text) or is_promo(text):
         return []
     text = _strip_junk_lines(text)
@@ -479,12 +452,6 @@ def parse_all(text: str) -> list[Vacancy]:
 def parse(text: str) -> Vacancy | None:
     vacancies = parse_all(text)
     return vacancies[0] if vacancies else None
-
-
-def _line_of(text: str, idx: int) -> str:
-    start = text.rfind("\n", 0, idx) + 1
-    end = text.find("\n", idx)
-    return text[start:] if end == -1 else text[start:end]
 
 
 def as_dict(v: Vacancy) -> dict:
