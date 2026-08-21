@@ -11,27 +11,18 @@ from telethon.sessions import StringSession
 from telethon.tl.types import User
 
 from .. import config, db
-from . import patterns
+from . import ingest
+from .ingest import load_channels, store_message
+
+__all__ = [
+    "client_from_env", "connected_client", "load_channels", "scrape", "store_message",
+]
 
 EXCLUDE_TOPIC_RE = re.compile(
     r"\b(cv|resume|резюме|кандидат|ищу\s*работ|open\s*to\s*work|job\s*seeker)\b",
     re.IGNORECASE,
 )
 
-
-def load_channels(path: Path | str | None = None) -> list[str]:
-    path = Path(path) if path else config.CHANNELS_FILE
-    if not path.exists():
-        return []
-    out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        line = line.replace("https://", "").replace("http://", "")
-        line = line.replace("t.me/", "").lstrip("@")
-        out.append(line)
-    return out
 
 
 def client_from_env() -> TelegramClient:
@@ -103,38 +94,6 @@ async def _author_contact(client, msg, entity) -> str | None:
     return None
 
 
-def store_message(
-    conn,
-    *,
-    channel: str,
-    message_id: int,
-    posted_at: str,
-    url: str,
-    text: str,
-    vacancies,
-    fallback_contact: str | None = None,
-    scraped_at: str | None = None,
-) -> int:
-    scraped_at = scraped_at or datetime.now(timezone.utc).isoformat()
-    db.delete_message(conn, channel, message_id)
-    for slot, vac in enumerate(vacancies):
-        db.insert(conn, {
-            "channel": channel,
-            "message_id": message_id,
-            "slot": slot,
-            "posted_at": posted_at,
-            "title": vac.title,
-            "company": vac.company,
-            "salary": vac.salary,
-            "location": vac.location,
-            "remote": int(vac.remote),
-            "contact": vac.contact or fallback_contact or None,
-            "url": url,
-            "raw_text": text,
-            "scraped_at": scraped_at,
-        })
-    return len(vacancies)
-
 
 async def scrape(
     days: int | None = None,
@@ -142,9 +101,10 @@ async def scrape(
     full: bool = False,
     limit_per_channel: int = 3000,
     verbose: bool = True,
+    counts: dict | None = None,
 ) -> dict:
     window_days = days or config.RETENTION_DAYS
-    channels = channels or load_channels()
+    channels = channels if channels is not None else load_channels()
     if not channels:
         raise SystemExit(
             f"No channels configured. Add channel handles to {config.CHANNELS_FILE}."
@@ -152,8 +112,7 @@ async def scrape(
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
     now_iso = datetime.now(timezone.utc).isoformat()
-    counts = {"scanned": 0, "matched": 0, "messages": 0, "channels": 0,
-              "topic_skipped": 0, "promo_skipped": 0, "pruned": 0}
+    counts = counts if counts is not None else ingest.new_counts()
 
     client = await connected_client()
 
@@ -170,6 +129,10 @@ async def scrape(
                     if verbose:
                         print(f"  ! skip {channel!r}: private / not a member")
                     continue
+                except FloodWaitError as e:
+                    counts["errors"] += 1
+                    print(f"  ! flood-wait {e.seconds}s resolving {channel!r}; stopping early")
+                    break
 
                 counts["channels"] += 1
                 since_id = 0 if full else db.get_watermark(conn, channel)
@@ -200,13 +163,7 @@ async def scrape(
                             counts["topic_skipped"] += 1
                             continue
 
-                        counts["scanned"] += 1
-
-                        if patterns.is_promo(text):
-                            counts["promo_skipped"] += 1
-                            continue
-
-                        vacs = patterns.parse_all(text)
+                        vacs = ingest.select_vacancies(counts, text)
                         if not vacs:
                             continue
 
@@ -225,18 +182,18 @@ async def scrape(
                             fallback_contact=fallback,
                             scraped_at=now_iso,
                         )
-                        counts["matched"] += len(vacs)
-                        counts["messages"] += 1
+                        ingest.record_message(counts, len(vacs))
                         ch_matched += len(vacs)
                 except FloodWaitError as e:
                     completed = False
                     print(f"  ! flood-wait {e.seconds}s on {channel!r}; stopping early")
 
-                if completed and newest_id:
-                    db.set_watermark(conn, channel, newest_id, newest_at, now_iso)
-                elif completed:
-                    db.set_watermark(conn, channel, since_id, None, now_iso)
-                conn.commit()
+                if completed:
+                    ingest.finish_channel(
+                        conn, channel,
+                        newest_id=newest_id, newest_at=newest_at,
+                        since_id=since_id, run_at=now_iso,
+                    )
 
                 if verbose:
                     print(f"  · {channel}: {ch_matched} matched")
@@ -244,7 +201,7 @@ async def scrape(
                 if not completed:
                     break
 
-            counts["pruned"] = db.prune(conn, config.RETENTION_DAYS)
+            counts["pruned"] += db.prune(conn, config.RETENTION_DAYS)
     finally:
         await client.disconnect()
 

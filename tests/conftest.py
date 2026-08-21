@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from src import config, db
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    def blocked(*args, **kwargs):
+        raise AssertionError(
+            "a test tried to open a network connection; pass a fake fetch/client in"
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", blocked)
 
 
 @pytest.fixture

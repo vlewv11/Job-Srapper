@@ -26,7 +26,14 @@ def _path(name: str, default: Path) -> Path:
     return Path(raw).expanduser() if raw else default
 
 
+def _choice(name: str, allowed: tuple[str, ...], default: str) -> str:
+    raw = (os.getenv(name) or "").strip().lower()
+    return raw if raw in allowed else default
+
+
 RETENTION_DAYS = _positive_int("RETENTION_DAYS", 30)
+
+SCRAPE_SOURCE = _choice("SCRAPE_SOURCE", ("auto", "preview", "telegram"), "auto")
 
 SCRAPE_INTERVAL_MINUTES = _positive_int("SCRAPE_INTERVAL_MINUTES", 10)
 

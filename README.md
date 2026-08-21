@@ -7,14 +7,27 @@ them in SQLite, and publishes a dark dashboard.
 It runs itself: **every 10 minutes** it pulls only what was posted since the
 last cycle, and **posts older than 30 days are deleted** from the database.
 
+**No Telegram account is required.** Public channels are read off their
+`t.me/s/<name>` web preview, which Telegram serves to anyone. Credentials are
+optional and only buy you the channels that have no such page.
+
 ```
    every 10 min
         │
-Telegram channels ──▶ scraper (Telethon) ──▶ regex parser ──▶ SQLite ──▶ dashboard
-                          ▲                                     │           (live or static)
-                          └── per-channel watermark ────────────┘
+        ├─▶ t.me/s/<channel>  (default — no credentials) ──┐
+        │                                                  ├─▶ regex parser ──▶ SQLite ──▶ dashboard
+        └─▶ MTProto/Telethon  (only for what has no        ─┘        │            (live or static)
+             web preview; needs TG_SESSION)                          │
+                          ▲                                          │
+                          └── per-channel watermark ─────────────────┘
                                                      30-day retention prune
 ```
+
+| Source | Credentials | Reaches | Fails when |
+| --- | --- | --- | --- |
+| `preview` | none | public channels | Telegram changes the preview markup |
+| `telegram` | `TG_API_ID`, `TG_API_HASH`, `TG_SESSION` | everything you can see, groups included | the session is revoked |
+| `auto` *(default)* | optional | public channels, plus the rest when credentials exist | — degrades to `preview` |
 
 ## Setup
 
@@ -23,27 +36,36 @@ Telegram channels ──▶ scraper (Telethon) ──▶ regex parser ──▶ 
    uv sync
    ```
 
-2. **Telegram API credentials.** Go to <https://my.telegram.org> → *API
-   development tools* → create an app. Copy `api_id` and `api_hash`:
+2. **Channels.** List them in `channels.txt` (one per line — `@name`,
+   `t.me/name`, or a full URL).
+
+3. **Fill the database** with the last 30 days, once:
+   ```bash
+   uv run python main.py backfill --days 30
+   ```
+
+That is the whole setup. The steps below are **optional**, and only needed for
+channels that serve no public web preview — groups, and channels whose owner
+turned the preview off. A cycle reports those by name and carries on without
+them.
+
+4. **Telegram API credentials.** <https://my.telegram.org> → *API development
+   tools* → create an app, then:
    ```bash
    cp .env.example .env
    # edit .env and paste TG_API_ID / TG_API_HASH
    ```
 
-3. **Channels.** List the channels you follow in `channels.txt`
-   (one per line — `@name`, `t.me/name`, or a full URL). You must already be a
-   member of any private channel.
-
-4. **Log in once** (interactive — enter your phone + the code Telegram sends).
-   A session file is saved under `data/` so later runs are non-interactive:
+5. **Log in once** (interactive — your phone plus the code Telegram sends).
+   A session file lands in `data/`, so later runs are non-interactive:
    ```bash
    uv run python main.py login
+   uv run python main.py session   # prints the string for the TG_SESSION secret
    ```
 
-5. **Fill the database** with the last 30 days, once:
-   ```bash
-   uv run python main.py backfill --days 30
-   ```
+   ⚠️ A string session is a live key to your account. Use it in **one place at
+   a time** — Telegram revokes an auth key it sees used from two IPs at once,
+   which silently kills the MTProto pass until you re-issue it. Never commit it.
 
 ## Usage
 
@@ -56,6 +78,8 @@ uv run python main.py run --no-scrape      # dashboard only
 # One cycle by hand (this is what the GitHub Action runs):
 uv run python main.py scrape               # incremental + prune
 uv run python main.py scrape --full        # ignore watermarks, re-read the window
+uv run python main.py scrape --source preview   # web pages only, ignore any session
+uv run python main.py scrape --source telegram  # MTProto only (needs TG_SESSION)
 
 # One-off maintenance / debugging:
 uv run python main.py backfill --days 30   # full re-read of a window
@@ -65,14 +89,40 @@ uv run python main.py parse "Senior LLM Engineer, remote, $150k/year"
 uv run python main.py session              # print the TG_SESSION secret for CI
 ```
 
-Settings are environment variables (`.env` works): `SCRAPE_INTERVAL_MINUTES`
-(default `10`), `RETENTION_DAYS` (default `30`), `DB_PATH`, `SITE_DIR`,
+`scrape` and `backfill` exit non-zero when **no** channel could be read, so a
+broken cycle is loud instead of publishing stale data. `--summary out.json`
+writes the counters for a CI step to act on.
+
+Settings are environment variables (`.env` works): `SCRAPE_SOURCE`
+(default `auto`), `SCRAPE_INTERVAL_MINUTES` (default `10`), `RETENTION_DAYS`
+(default `30`), `PREVIEW_DELAY_SECONDS` (default `1.0`), `DB_PATH`, `SITE_DIR`,
 `CHANNELS_FILE`.
+
+## Reading channels without an account
+
+`https://t.me/s/<channel>` is a server-rendered page Telegram publishes for
+every public channel: the newest 20 posts, each with its id, UTC timestamp and
+full text, and `?before=<id>` walks backwards through history. That is
+everything the parser needs, so the default cycle uses no API id, no api hash
+and no session, and cannot be locked out by a revoked auth key.
+
+`src/scraping/preview.py` parses those pages with `html.parser`, scoped to
+`div.tgme_widget_message_text`. **That scoping is load-bearing:** Telegram renders
+a link-preview card next to the body carrying the headline and summary of
+whatever the post linked to, plus view counts and reactions. Letting any of that
+into the text would invent vacancies out of news articles, so the parser reads
+the body div and nothing else. Message text comes out byte-identical to
+Telethon's `message` — verified against 136 posts the MTProto backend had
+already stored, with zero differences.
+
+Two things the preview cannot do: groups and preview-disabled channels serve a
+redirect instead of a page (they need MTProto), and forum topics don't exist
+there, so the CV-topic filter only applies to the MTProto pass.
 
 ## Smart (incremental) scraping
 
-Every message Telegram returns carries its id and post time, and messages come
-back newest-first — so a cycle never downloads the whole history:
+Both backends return posts newest-first with an id and a post time, so a cycle
+never downloads the whole history:
 
 - each channel stores a **watermark** (`channel_state.last_message_id`), and
   the next cycle asks Telegram only for messages *after* it;
@@ -85,7 +135,9 @@ back newest-first — so a cycle never downloads the whole history:
   deleted automatically**.
 
 A full 30-day backfill reads ~1500 posts across 14 channels; the incremental
-cycle that follows reads 0 and finishes in seconds.
+cycle that follows reads 0 and finishes in seconds. On the preview backend the
+watermark usually sits inside the newest page, so a quiet channel costs exactly
+one HTTP request per cycle (`PREVIEW_DELAY_SECONDS` spaces them out).
 
 ## Dashboard
 
@@ -104,18 +156,25 @@ scrapes, prunes, rebuilds the static site and publishes it to
 `https://<user>.github.io/<repo>/`.
 
 1. **Settings → Pages → Source: GitHub Actions.**
-2. **Settings → Secrets and variables → Actions**, add:
+2. Push to `master`. The workflow can also be started by hand from the
+   **Actions** tab (with optional `full` / `days` / `source` inputs).
+
+**No secrets are required.** The default `auto` source reads every public
+channel off `t.me/s/`, which needs no credentials at all.
+
+Only add secrets if your list includes channels with no public web preview:
+
    | Secret | Value |
    |---|---|
    | `TG_API_ID`   | from my.telegram.org |
    | `TG_API_HASH` | from my.telegram.org |
    | `TG_SESSION`  | output of `uv run python main.py session` |
-3. Push to `master`. The workflow can also be started by hand from the
-   **Actions** tab (with optional `full` / `days` inputs).
 
 `TG_SESSION` is an exported Telethon *string session* — CI has no session file
-of its own. It is a login credential: keep it in Actions secrets only, and
-re-run `main.py session` if you ever revoke the session in Telegram.
+of its own — and it is a login credential to your account. Keep it in Actions
+secrets only. Telegram revokes an auth key it sees used from more than one IP at
+a time, so do not keep the same string in a local `.env` while CI is running;
+re-issue it with `main.py session` when that happens.
 
 **How state survives between runs.** The SQLite file is force-pushed to a
 parentless `state` branch after every successful cycle and restored at the
@@ -126,13 +185,20 @@ history never grows. The branch is machine-managed — don't commit to it.
 
 - Keep the repo **public**: Pages and Actions minutes are free there. On a
   private repo a `*/10` cron would exhaust the free Actions minutes in days.
-- GitHub's cron is best-effort — a run can be delayed or skipped when the
-  runner pool is busy, and **scheduled workflows are disabled after 60 days
-  without repository activity**.
+- GitHub's cron is best-effort — `*/10` in practice lands closer to every
+  20–40 minutes, a run can be dropped when the runner pool is busy or when the
+  previous one is still inside the `scrape-deploy` concurrency group, and
+  **scheduled workflows are disabled after 60 days without repository
+  activity**.
 - Every deployed page is public. Only publish channels you are comfortable
   republishing.
-- If Telegram fails, the step is non-fatal: the previous data is redeployed and
-  the next cycle catches up.
+- **A cycle that reads nothing fails the run**, so the database is never
+  persisted and the site is never rebuilt from a scrape that did not happen.
+  A *partial* cycle still publishes — a channel that errored, or an MTProto pass
+  skipped for a dead session, is reported as a `::warning::` annotation and in
+  the run summary rather than failing everything. Do not wrap the scrape step in
+  `continue-on-error`: that turns a broken cycle into a green run that keeps
+  redeploying stale data.
 
 `.github/workflows/ci.yml` runs the test suite on every push and pull request.
 
@@ -180,7 +246,10 @@ src/
 ├── db.py                   SQLite schema, dedup upsert, watermarks, retention prune
 ├── scraping/
 │   ├── patterns.py         regex matching + field extraction (the part to tune)
-│   ├── telegram.py         Telethon reader — incremental window + CV-topic skip
+│   ├── ingest.py           channel list, post → vacancy rows, watermarks (no Telethon)
+│   ├── preview.py          t.me/s/ reader — the default, needs no credentials
+│   ├── telegram.py         Telethon reader — groups, private channels, CV-topic skip
+│   ├── runner.py           picks the backend, degrades instead of failing
 │   └── scheduler.py        the every-10-minutes loop
 └── web/
     ├── app.py              FastAPI app (`/`, `/healthz`)

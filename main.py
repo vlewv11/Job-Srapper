@@ -2,19 +2,38 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import sys
 
 from src import config
 from src.scraping import patterns
+from src.scraping.runner import SOURCES
 
 
-def _report(counts: dict) -> None:
+def _write_summary(path: str | None, counts: dict) -> None:
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(counts, fh, indent=1, sort_keys=True)
+
+
+def _report(counts: dict) -> int:
     print(
         f"\nDone. {counts['channels']} channel(s): scanned {counts['scanned']} new "
         f"post(s), stored {counts['matched']} vacancies from {counts['messages']} "
         f"post(s). Skipped {counts['promo_skipped']} promo/course, "
         f"{counts['topic_skipped']} CV-topic. Pruned {counts['pruned']} expired."
     )
+    if counts["errors"]:
+        print(f"{counts['errors']} channel(s) errored.")
+    if not counts["channels"]:
+        print(
+            "No channel was read. Nothing was stored, so the database is unchanged.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def cmd_login(args):
@@ -46,19 +65,25 @@ def cmd_session(args):
 
 
 def cmd_scrape(args):
-    from src.scraping.telegram import scrape
+    from src.scraping import runner
 
     days = args.days or config.RETENTION_DAYS
     mode = "full" if args.full else "incremental"
-    print(f"Scraping ({mode}, window {days}d)…")
-    _report(asyncio.run(scrape(days=days, full=args.full)))
+    source = runner.resolve_source(args.source)
+    print(f"Scraping ({mode}, window {days}d, source {source})…")
+    counts = asyncio.run(runner.run(days=days, full=args.full, source=source))
+    _write_summary(args.summary, counts)
+    return _report(counts)
 
 
 def cmd_backfill(args):
-    from src.scraping.telegram import scrape
+    from src.scraping import runner
 
-    print(f"Backfilling the last {args.days} day(s) from scratch…")
-    _report(asyncio.run(scrape(days=args.days, full=True)))
+    source = runner.resolve_source(args.source)
+    print(f"Backfilling the last {args.days} day(s) from scratch (source {source})…")
+    counts = asyncio.run(runner.run(days=args.days, full=True, source=source))
+    _write_summary(args.summary, counts)
+    return _report(counts)
 
 
 def cmd_prune(args):
@@ -82,13 +107,16 @@ def cmd_run(args):
     import uvicorn
 
     os.environ["AUTO_SCRAPE"] = "0" if args.no_scrape else "1"
+    if args.source:
+        os.environ["SCRAPE_SOURCE"] = args.source
+        config.SCRAPE_SOURCE = args.source
     if args.interval:
         os.environ["SCRAPE_INTERVAL_MINUTES"] = str(args.interval)
         config.SCRAPE_INTERVAL_MINUTES = args.interval
     print(
         f"Dashboard → http://{args.host}:{args.port}  "
-        f"(auto-scrape every {config.SCRAPE_INTERVAL_MINUTES} min, "
-        f"keeping {config.RETENTION_DAYS} days)"
+        f"(auto-scrape every {config.SCRAPE_INTERVAL_MINUTES} min from "
+        f"{config.SCRAPE_SOURCE}, keeping {config.RETENTION_DAYS} days)"
     )
     uvicorn.run("src.web.app:app", host=args.host, port=args.port)
 
@@ -103,6 +131,24 @@ def cmd_parse(args):
             print(f"--- vacancy {i + 1}/{len(vacs)} ---")
         for k, v in patterns.as_dict(vac).items():
             print(f"  {k:9}: {v}")
+
+
+def _add_summary(parser) -> None:
+    parser.add_argument(
+        "--summary", default=None,
+        help="write the cycle counters to this path as JSON",
+    )
+
+
+def _add_source(parser) -> None:
+    parser.add_argument(
+        "--source", choices=SOURCES, default=None,
+        help=(
+            "preview = t.me/s/ web pages, no credentials; telegram = MTProto, needs "
+            f"a session; auto = preview then MTProto for the rest "
+            f"(default {config.SCRAPE_SOURCE})"
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -127,10 +173,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"window in days (default {config.RETENTION_DAYS})")
     sp.add_argument("--full", action="store_true",
                     help="ignore watermarks and re-read the whole window")
+    _add_source(sp)
+    _add_summary(sp)
     sp.set_defaults(func=cmd_scrape)
 
     bf = sub.add_parser("backfill", help="one-off full scrape of the last N days")
     bf.add_argument("--days", type=int, default=config.RETENTION_DAYS)
+    _add_source(bf)
+    _add_summary(bf)
     bf.set_defaults(func=cmd_backfill)
 
     pr = sub.add_parser("prune", help="delete vacancies past the retention window")
@@ -147,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--interval", type=int, default=None,
                     help=f"minutes between scrapes (default {config.SCRAPE_INTERVAL_MINUTES})")
     rn.add_argument("--no-scrape", action="store_true", help="serve only, do not scrape")
+    _add_source(rn)
     rn.set_defaults(func=cmd_run)
 
     pp = sub.add_parser("parse", help="classify one message (debug)")
@@ -158,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
     args = build_parser().parse_args()
-    args.func(args)
+    raise SystemExit(args.func(args) or 0)
 
 
 if __name__ == "__main__":

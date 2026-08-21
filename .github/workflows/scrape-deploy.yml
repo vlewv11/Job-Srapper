@@ -13,6 +13,11 @@ on:
         description: "Window in days"
         type: string
         default: "30"
+      source:
+        description: "Where to read posts from"
+        type: choice
+        default: auto
+        options: [auto, preview, telegram]
   push:
     branches: [master]
     paths:
@@ -36,6 +41,10 @@ env:
   RETENTION_DAYS: "30"
   SCRAPE_INTERVAL_MINUTES: "10"
   SITE_DIR: site
+  # Public channels are read straight off t.me/s/, so a cycle needs no Telegram
+  # credentials at all. The MTProto pass only runs for channels that serve no web
+  # preview, and only when the secrets below happen to be set.
+  SCRAPE_SOURCE: ${{ inputs.source || 'auto' }}
 
 jobs:
   scrape:
@@ -63,9 +72,10 @@ jobs:
             echo "No '$STATE_BRANCH' branch yet — starting from an empty database."
           fi
 
-      - name: Scrape Telegram
-        id: scrape
-        continue-on-error: true
+      # No continue-on-error: a cycle that reads nothing must fail the run and
+      # show up red. Masking it here is what let a dead session go unnoticed for
+      # three days while the site kept redeploying stale data.
+      - name: Scrape
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -73,15 +83,31 @@ jobs:
           FULL: ${{ inputs.full && '--full' || '' }}
           DAYS: ${{ inputs.days || '30' }}
         run: |
-          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ] || [ -z "$TG_SESSION" ]; then
-            echo "::warning::Telegram secrets are not set — publishing existing data without scraping."
-            uv run python main.py prune
-            exit 0
-          fi
-          uv run python main.py scrape --days "$DAYS" $FULL
+          uv run python main.py scrape --days "$DAYS" $FULL \
+            --summary "$RUNNER_TEMP/counts.json"
+
+      - name: Summarise the cycle
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/counts.json" ] || exit 0
+          python3 - "$RUNNER_TEMP/counts.json" <<'PY'
+          import json, os, sys
+
+          c = json.load(open(sys.argv[1]))
+          line = (
+              f"{c['channels']} channel(s) · +{c['matched']} vacancies from "
+              f"{c['messages']} post(s) · pruned {c['pruned']} · "
+              f"{c['errors']} error(s)"
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(line + "\n")
+          if c["errors"]:
+              # Surfaced as an annotation on the run: a degraded cycle stays
+              # visible even though it still published.
+              print(f"::warning::{line}")
+          PY
 
       - name: Persist the database
-        if: steps.scrape.outcome == 'success'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
