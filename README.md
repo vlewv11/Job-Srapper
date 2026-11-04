@@ -86,12 +86,12 @@ uv run python main.py backfill --days 30   # full re-read of a window
 uv run python main.py prune                # drop everything older than 30 days
 uv run python main.py build                # export the static site to site/
 uv run python main.py parse "Senior LLM Engineer, remote, $150k/year"
-uv run python main.py session              # print the TG_SESSION secret for CI
+uv run python main.py session              # print the TG_SESSION string
 ```
 
 `scrape` and `backfill` exit non-zero when **no** channel could be read, so a
 broken cycle is loud instead of publishing stale data. `--summary out.json`
-writes the counters for a CI step to act on.
+writes the counters to a file.
 
 Settings are environment variables (`.env` works): `SCRAPE_SOURCE`
 (default `auto`), `SCRAPE_INTERVAL_MINUTES` (default `10`), `RETENTION_DAYS`
@@ -149,59 +149,6 @@ rendered client-side, so a page built an hour ago still says "1h ago".
 
 `GET /healthz` reports row count, last scrape time and the active settings.
 
-## Deploying free on GitHub Pages
-
-`.github/workflows/scrape-deploy.yml` is the whole deployment: a `*/10` cron
-scrapes, prunes, rebuilds the static site and publishes it to
-`https://<user>.github.io/<repo>/`.
-
-1. **Settings → Pages → Source: GitHub Actions.**
-2. Push to `master`. The workflow can also be started by hand from the
-   **Actions** tab (with optional `full` / `days` / `source` inputs).
-
-**No secrets are required.** The default `auto` source reads every public
-channel off `t.me/s/`, which needs no credentials at all.
-
-Only add secrets if your list includes channels with no public web preview:
-
-   | Secret | Value |
-   |---|---|
-   | `TG_API_ID`   | from my.telegram.org |
-   | `TG_API_HASH` | from my.telegram.org |
-   | `TG_SESSION`  | output of `uv run python main.py session` |
-
-`TG_SESSION` is an exported Telethon *string session* — CI has no session file
-of its own — and it is a login credential to your account. Keep it in Actions
-secrets only. Telegram revokes an auth key it sees used from more than one IP at
-a time, so do not keep the same string in a local `.env` while CI is running;
-re-issue it with `main.py session` when that happens.
-
-**How state survives between runs.** The SQLite file is force-pushed to a
-parentless `state` branch after every successful cycle and restored at the
-start of the next one, so watermarks and vacancies persist while that branch's
-history never grows. The branch is machine-managed — don't commit to it.
-
-**Worth knowing.**
-
-- Keep the repo **public**: Pages and Actions minutes are free there. On a
-  private repo a `*/10` cron would exhaust the free Actions minutes in days.
-- GitHub's cron is best-effort — `*/10` in practice lands closer to every
-  20–40 minutes, a run can be dropped when the runner pool is busy or when the
-  previous one is still inside the `scrape-deploy` concurrency group, and
-  **scheduled workflows are disabled after 60 days without repository
-  activity**.
-- Every deployed page is public. Only publish channels you are comfortable
-  republishing.
-- **A cycle that reads nothing fails the run**, so the database is never
-  persisted and the site is never rebuilt from a scrape that did not happen.
-  A *partial* cycle still publishes — a channel that errored, or an MTProto pass
-  skipped for a dead session, is reported as a `::warning::` annotation and in
-  the run summary rather than failing everything. Do not wrap the scrape step in
-  `continue-on-error`: that turns a broken cycle into a green run that keeps
-  redeploying stale data.
-
-`.github/workflows/ci.yml` runs the test suite on every push and pull request.
-
 ## How matching works
 
 A message is kept only if it advertises a real ML/AI/LLM role — a **domain**
@@ -254,10 +201,9 @@ src/
 └── web/
     ├── app.py              FastAPI app (`/`, `/healthz`)
     ├── render.py           page model shared by the live and static dashboards
-    ├── build.py            static export for GitHub Pages
+    ├── build.py            static export
     └── templates/          dashboard HTML + client-side filtering
 tests/                      uv run pytest
-.github/workflows/          ci.yml (tests) · scrape-deploy.yml (cron → Pages)
 ```
 
 The code carries no comments by design — the README is the documentation.
